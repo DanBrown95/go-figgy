@@ -1,4 +1,4 @@
-module github.com/Syncbak-Git/go-figgy
+module github.com/DanBrown95/go-figgy
 
 require (
 	github.com/aws/aws-sdk-go v1.23.13
