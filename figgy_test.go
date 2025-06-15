@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 )
@@ -16,6 +18,28 @@ import (
 type MockSSMClient struct {
 	ssmiface.SSMAPI
 	Data map[string]*ssm.GetParameterOutput
+}
+
+type MockSecretsManagerClient struct {
+	secretsmanageriface.SecretsManagerAPI
+	Secrets map[string]string
+}
+
+func NewMockSecretsManagerClient() *MockSecretsManagerClient {
+	return &MockSecretsManagerClient{
+		Secrets: map[string]string{
+			"mysecret": "supersecret",
+		},
+	}
+}
+
+func (m *MockSecretsManagerClient) GetSecretValue(input *secretsmanager.GetSecretValueInput) (*secretsmanager.GetSecretValueOutput, error) {
+	if val, ok := m.Secrets[*input.SecretId]; ok {
+		return &secretsmanager.GetSecretValueOutput{
+			SecretString: aws.String(val),
+		}, nil
+	}
+	return nil, fmt.Errorf("secret not found: %s", *input.SecretId)
 }
 
 func (c MockSSMClient) GetParameter(i *ssm.GetParameterInput) (*ssm.GetParameterOutput, error) {
@@ -335,6 +359,7 @@ type Types struct {
 	Float64        float64       `ssm:"float64"`
 	Duration       time.Duration `ssm:"duration"`
 	DurationString time.Duration `ssm:"durationstring"`
+	SecretValue    string        `secretmanager:"mysecret"`
 
 	//UintptrStr uintptr
 
@@ -403,15 +428,16 @@ func TestNonPtrAndNilInput(t *testing.T) {
 	}
 
 	m := NewMockSSMClient()
+	sm := NewMockSecretsManagerClient()
 	for n, tc := range tests {
-		err := Load(m, tc.in)
+		err := Load(m, sm, tc.in)
 		assert.EqualErrorf(t, err, tc.want.Error(), "unexpected error while executing test %s", n)
 	}
 }
 
 func TestTypeConvert(t *testing.T) {
 	ex := NewTypes()
-	err := Load(NewMockSSMClient(), ex)
+	err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), ex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +460,7 @@ func TestUnmarshalIface(t *testing.T) {
 		}}
 
 	for n, tc := range tests {
-		err := Load(NewMockSSMClient(), tc.in)
+		err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), tc.in)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -465,7 +491,7 @@ func TestTypeConvertErrors(t *testing.T) {
 	}
 
 	for n, tc := range tests {
-		err := Load(NewMockSSMClient(), tc.in)
+		err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), tc.in)
 		assert.EqualError(t, err, tc.want.Error(), "test '%s' failed", n)
 	}
 }
@@ -474,7 +500,7 @@ func TestInvalidParams(t *testing.T) {
 	var c struct {
 		Invalid string `ssm:"/no/such/param"`
 	}
-	err := Load(NewMockSSMClient(), &c)
+	err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), &c)
 	assert.Error(t, err)
 }
 
@@ -484,13 +510,15 @@ func TestMixedPlainAndDecryptParams(t *testing.T) {
 		Plain2   bool   `ssm:"bool"`
 		Decrypt1 int    `ssm:"int,decrypt"`
 		Decrypt2 int32  `ssm:"int32,decrypt"`
+		Secret   string `secretmanager:"mysecret"`
 	}
-	err := Load(NewMockSSMClient(), &c)
+	err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), &c)
 	assert.NoError(t, err)
 	assert.Equal(t, c.Plain1, "this is a string")
 	assert.Equal(t, c.Plain2, true)
 	assert.Equal(t, c.Decrypt1, 2)
 	assert.Equal(t, c.Decrypt2, int32(5))
+	assert.Equal(t, c.Secret, "supersecret")
 }
 
 type JSONTest struct {
@@ -510,7 +538,7 @@ type SimpleJSON struct {
 
 func TestJSON(t *testing.T) {
 	var j JSONTest
-	err := Load(NewMockSSMClient(), &j)
+	err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), &j)
 	assert.NoError(t, err)
 	s := SimpleJSON{F1: 1, F2: "2"}
 	assert.Equal(t, s, j.JSON)
@@ -525,7 +553,7 @@ func TestJSONError(t *testing.T) {
 	var j struct {
 		SimpleJSON `ssm:"badjson,json"`
 	}
-	err := Load(NewMockSSMClient(), &j)
+	err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), &j)
 	assert.Error(t, err)
 }
 
@@ -533,7 +561,7 @@ func TestJSONWithUnmarshallerError(t *testing.T) {
 	var j struct {
 		Test str `ssm:"string,json"`
 	}
-	err := Load(NewMockSSMClient(), &j)
+	err := Load(NewMockSSMClient(), NewMockSecretsManagerClient(), &j)
 	assert.Error(t, err)
 }
 
@@ -565,6 +593,50 @@ func TestTagParse(t *testing.T) {
 			data: P{"env": "dev"}},
 		"with json": {in: struct {
 			Field string `ssm:"simplejson,json"`
+		}{}, want: &field{key: "simplejson", json: true}, err: nil},
+	}
+
+	for n, tc := range tests {
+		f := reflect.TypeOf(tc.in).Field(0) //Not the safest assumption
+		tag, err := tag(f, tc.data)
+		if tc.want != nil {
+			assert.Equalf(t, tc.want.key, tag.key, "keys are do not match for test %s", n)
+			assert.Equalf(t, tc.want.decrypt, tag.decrypt, "decrypt flag does not match for test %s", n)
+		}
+		if err != nil {
+			assert.EqualError(t, err, tc.err.Error())
+		}
+	}
+}
+
+func TestSecretTagParse(t *testing.T) {
+	tests := map[string]struct {
+		in   interface{}
+		data interface{}
+		want *field
+		err  error
+	}{
+		"key only": {in: struct {
+			Field string `secretmanager:"parsed"`
+		}{}, want: &field{key: "parsed"}, err: nil},
+		"with decrypt (should be ignored)": {in: struct {
+			Field string `secretmanager:"parsed,decrypt"`
+		}{}, want: &field{key: "parsed", decrypt: false}, err: nil},
+		"without key": {in: struct {
+			Field string `secretmanager:","`
+		}{}, want: nil, err: &TagParseError{Tag: ",", Field: "Field"}},
+		"empty tag": {in: struct {
+			Field string `secretmanager:""`
+		}{}, want: nil, err: nil},
+		"ignoreKey": {in: struct {
+			Field string `secretmanager:"-"`
+		}{}, want: nil, err: nil},
+		"with parameter": {in: struct {
+			Fields string `secretmanager:"/{{.env}}/environment"`
+		}{}, want: &field{key: "/dev/environment"},
+			data: P{"env": "dev"}},
+		"with json": {in: struct {
+			Field string `secretmanager:"simplejson,json"`
 		}{}, want: &field{key: "simplejson", json: true}, err: nil},
 	}
 

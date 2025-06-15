@@ -1,4 +1,4 @@
-//Package figgy provides tags for loading parameters from AWS Parameter Store
+// Package figgy provides tags for loading parameters from AWS Parameter Store
 package figgy
 
 import (
@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/secretsmanager"
+	"github.com/aws/aws-sdk-go/service/secretsmanager/secretsmanageriface"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 )
@@ -73,11 +75,12 @@ func (e *ConvertTypeError) Error() string {
 
 // field represents parse struct fields tags and the underlying value
 type field struct {
-	key     string
-	decrypt bool
-	json    bool
-	value   reflect.Value
-	field   reflect.StructField
+	key         string
+	decrypt     bool
+	json        bool
+	fromSecrets bool // if true, the field is loaded from AWS Secrets Manager instead of Parameter Store
+	value       reflect.Value
+	field       reflect.StructField
 }
 
 func newField(key string, decrypt bool) *field {
@@ -97,8 +100,8 @@ type P map[string]interface{}
 // match the array's typing.
 //
 // You can ignore a field by using "-" for a fields tag.  Unexported fields are also ignored.
-func Load(c ssmiface.SSMAPI, v interface{}) error {
-	return LoadWithParameters(c, v, nil)
+func Load(ssmClient ssmiface.SSMAPI, secretsClient secretsmanageriface.SecretsManagerAPI, v interface{}) error {
+	return LoadWithParameters(ssmClient, secretsClient, v, nil)
 }
 
 // LoadWithParameters loads AWS Parameter Store parameters based on the defined tags, performing parameter
@@ -109,7 +112,7 @@ func Load(c ssmiface.SSMAPI, v interface{}) error {
 // match the array's typing.
 //
 // You can ignore a field by using "-" for a fields tag.  Unexported fields are also ignored.
-func LoadWithParameters(c ssmiface.SSMAPI, v interface{}, data interface{}) error {
+func LoadWithParameters(ssmClient ssmiface.SSMAPI, secretsClient secretsmanageriface.SecretsManagerAPI, v interface{}, data interface{}) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Ptr || rv.IsNil() {
 		return &InvalidTypeError{Type: reflect.TypeOf(v)}
@@ -118,23 +121,41 @@ func LoadWithParameters(c ssmiface.SSMAPI, v interface{}, data interface{}) erro
 	if err != nil {
 		return err
 	}
-	return load(c, t)
+	return load(ssmClient, secretsClient, t)
 }
 
 // load fields from AWS Parameter Store
-func load(c ssmiface.SSMAPI, f []*field) error {
-	plain, decrypt := partitionFields(f, func(x *field) bool {
-		return x.decrypt
-	})
-	err := batchIterateFields(plain, maxParameters, func(f []*field) error {
-		return loadParameters(c, f, false)
-	})
-	if err != nil {
+func load(ssmClient ssmiface.SSMAPI, secretsClient secretsmanageriface.SecretsManagerAPI, fields []*field) error {
+	var ssmPlain, ssmDecrypt, secrets []*field
+	for _, f := range fields {
+		if f.fromSecrets {
+			secrets = append(secrets, f)
+		} else if f.decrypt {
+			ssmDecrypt = append(ssmDecrypt, f)
+		} else {
+			ssmPlain = append(ssmPlain, f)
+		}
+	}
+
+	if err := batchIterateFields(ssmPlain, maxParameters, func(f []*field) error {
+		return loadParameters(ssmClient, f, false)
+	}); err != nil {
 		return err
 	}
-	return batchIterateFields(decrypt, maxParameters, func(f []*field) error {
-		return loadParameters(c, f, true)
-	})
+
+	if err := batchIterateFields(ssmDecrypt, maxParameters, func(f []*field) error {
+		return loadParameters(ssmClient, f, true)
+	}); err != nil {
+		return err
+	}
+
+	if err := batchIterateFields(secrets, 1, func(f []*field) error {
+		return loadSecrets(secretsClient, f)
+	}); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // in place half stable partition
@@ -164,6 +185,28 @@ func batchIterateFields(f []*field, batchSize int, g func([]*field) error) error
 			return err
 		}
 		i = j
+	}
+	return nil
+}
+
+func loadSecrets(c secretsmanageriface.SecretsManagerAPI, f []*field) error {
+	for _, x := range f {
+		out, err := c.GetSecretValue(&secretsmanager.GetSecretValueInput{
+			SecretId: aws.String(x.key),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to retrieve secret for key '%s': %w", x.key, err)
+		}
+		value := aws.StringValue(out.SecretString)
+		err = set(x, value)
+		if err != nil {
+			switch err := err.(type) {
+			case *ConvertTypeError:
+				err.Field = x.field.Name
+				return err
+			}
+			return err
+		}
 	}
 	return nil
 }
@@ -267,15 +310,40 @@ func walk(v reflect.Value, data interface{}) ([]*field, error) {
 
 // tag parses the ssm tag from a given field
 func tag(f reflect.StructField, data interface{}) (*field, error) {
-	t := f.Tag.Get("ssm")
-	if t == "" || t == "-" {
+	var fld *field
+
+	if secretTag := f.Tag.Get("secretmanager"); secretTag != "" {
+		if secretTag == "-" {
+			return nil, nil
+		}
+		o := strings.Split(secretTag, ",")
+		fld = newField(strings.TrimSpace(o[0]), false)
+		fld.fromSecrets = true
+	} else if ssmTag := f.Tag.Get("ssm"); ssmTag != "" {
+		if ssmTag == "-" {
+			return nil, nil
+		}
+		o := strings.Split(ssmTag, ",")
+		fld = newField(strings.TrimSpace(o[0]), false)
+		for _, option := range o[1:] {
+			switch strings.TrimSpace(option) {
+			case "decrypt":
+				fld.decrypt = true
+			case "json":
+				fld.json = true
+			}
+		}
+	} else {
 		return nil, nil
 	}
-	o := strings.Split(t, ",")
-	fld := newField(strings.TrimSpace(o[0]), false)
+
 	if fld.key == "" {
-		return nil, &TagParseError{Tag: t, Field: f.Name}
+		if fld.fromSecrets {
+			return nil, &TagParseError{Tag: f.Tag.Get("secretmanager"), Field: f.Name}
+		}
+		return nil, &TagParseError{Tag: f.Tag.Get("ssm"), Field: f.Name}
 	}
+
 	tpl, err := template.New(fld.key).Parse(fld.key)
 	if err == nil {
 		b := &bytes.Buffer{}
@@ -284,14 +352,7 @@ func tag(f reflect.StructField, data interface{}) (*field, error) {
 			fld.key = b.String()
 		}
 	}
-	for _, option := range o[1:] {
-		switch strings.TrimSpace(option) {
-		case "decrypt":
-			fld.decrypt = true
-		case "json":
-			fld.json = true
-		}
-	}
+
 	return fld, nil
 }
 
